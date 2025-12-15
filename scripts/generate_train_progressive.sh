@@ -1,0 +1,34 @@
+#!/bin/bash
+cd "$(dirname "$0")/.."
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 2 -o data/examples-0.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 3 -o data/examples-1.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 3 -o data/examples-2.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 4 -o data/examples-3.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 4 -o data/examples-4.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 4 -o data/examples-5.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 4 -o data/examples-6.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-7.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-8.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-8.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-10.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-11.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-12.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-13.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 5 -o data/examples-14.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-15.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-16.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-17.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-18.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-19.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-20.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-21.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-22.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-23.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-24.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-25.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-26.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-27.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-28.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-29.jsonl --show
+uv run python example_generator.py -n 50000 --min-digits 1 --max-digits 6 -o data/examples-20.jsonl --show
+uv run python example_generator.py -n 100000 --min-digits 1 --max-digits 6 -o data/examples-21.jsonl --show
