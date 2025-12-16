@@ -15,14 +15,27 @@ from train import MathDataset, collate_fn, create_loss_weights
 from generate import CharTokenizer
 
 
+def load_lr_profile(config_path: Path = Path("config/lr_profile.json")) -> list[float]:
+    """Load LR profile from config file."""
+    if not config_path.exists():
+        raise FileNotFoundError(f"LR profile config not found: {config_path}")
+    with open(config_path) as f:
+        config = json.load(f)
+    return config["profile"]
+
+
 @dataclass
 class EvalMetrics:
     """Evaluation metrics."""
 
     loss_total: float
-    loss_reasoning: float
-    loss_answer: float
+    loss_reasoning: float  # reasoning only, without </w> tag
+    loss_answer: float  # answer only, without </a> tag
     accuracy: float  # Exact match on answer
+
+
+# Length of closing tags in tokens (</w> = 4 chars, </a> = 4 chars)
+CLOSING_TAG_LEN = 4
 
 
 def compute_separate_losses(
@@ -31,9 +44,13 @@ def compute_separate_losses(
     reasoning_ranges: list[tuple[int, int]],
     answer_ranges: list[tuple[int, int]],
 ) -> tuple[float, float]:
-    """Compute separate losses for reasoning and answer parts."""
+    """
+    Compute separate losses for reasoning and answer parts.
+
+    Returns: (loss_reasoning, loss_answer)
+    - Excludes closing tags (</w>, </a>) - content only
+    """
     batch_size, seq_len = targets.shape
-    device = logits.device
 
     loss_per_token = F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
@@ -50,12 +67,18 @@ def compute_separate_losses(
         r_start, r_end = reasoning_ranges[b]
         # Shift by -1 because targets are shifted
         r_start_t, r_end_t = max(0, r_start - 1), max(0, r_end - 1)
+        # Exclude closing tag </w>
+        r_end_t = max(r_start_t, r_end_t - CLOSING_TAG_LEN)
+
         if r_end_t > r_start_t and r_end_t <= seq_len:
             reasoning_loss_sum += loss_per_token[b, r_start_t:r_end_t].sum().item()
             reasoning_count += r_end_t - r_start_t
 
         a_start, a_end = answer_ranges[b]
         a_start_t, a_end_t = max(0, a_start - 1), max(0, a_end - 1)
+        # Exclude closing tag </a>
+        a_end_t = max(a_start_t, a_end_t - CLOSING_TAG_LEN)
+
         if a_end_t > a_start_t and a_end_t <= seq_len:
             answer_loss_sum += loss_per_token[b, a_start_t:a_end_t].sum().item()
             answer_count += a_end_t - a_start_t
@@ -168,8 +191,13 @@ def evaluate(
 TSV_COLUMNS = [
     "timestamp",
     "epoch",
+    "difficulty",
     "unfrozen_start",
     "unfrozen_end",
+    "max_seq_len",
+    "layer_lrs",
+    "layer_weight_norms",
+    "layer_weight_rms_changes",
     "train_loss",
     "train_loss_w",
     "train_loss_a",
@@ -188,11 +216,16 @@ TSV_COLUMNS = [
 def log_metrics(
     log_path: Path,
     epoch: int,
+    difficulty: int,
     train_metrics: EvalMetrics,
     test_metrics: EvalMetrics | None,
     test_complex_metrics: EvalMetrics | None = None,
     start_layer: int | None = None,
     end_layer: int | None = None,
+    max_seq_len: int = 0,
+    layer_lrs: str = "",
+    layer_weight_norms: str = "",
+    layer_weight_rms_changes: str = "",
 ):
     """Append metrics to TSV log file."""
     # Write header if file doesn't exist
@@ -202,8 +235,13 @@ def log_metrics(
     values = [
         timestamp,
         epoch,
+        difficulty,
         start_layer if start_layer is not None else "",
         end_layer if end_layer is not None else "",
+        max_seq_len,
+        layer_lrs,
+        layer_weight_norms,
+        layer_weight_rms_changes,
         f"{train_metrics.loss_total:.6f}",
         f"{train_metrics.loss_reasoning:.6f}",
         f"{train_metrics.loss_answer:.6f}",
@@ -224,16 +262,20 @@ def log_metrics(
         f.write("\t".join(str(v) for v in values) + "\n")
 
 
-def get_train_file(base_path: Path, layer_idx: int) -> Path:
+def get_difficulty_files(data_dir: Path, difficulty: int) -> tuple[Path, Path, Path] | None:
     """
-    Get training file for given layer index.
+    Get train, test, and test-complex files for given difficulty level.
 
-    Tries examples-{layer_idx}.jsonl first, falls back to base_path.
+    Returns (train_file, test_file, test_complex_file) or None if train file doesn't exist.
     """
-    layer_file = base_path.parent / f"examples-{layer_idx}.jsonl"
-    if layer_file.exists():
-        return layer_file
-    return base_path
+    train_file = data_dir / f"examples-{difficulty}.jsonl"
+    test_file = data_dir / f"test-{difficulty}.jsonl"
+    test_complex_file = data_dir / f"test-complex-{difficulty}.jsonl"
+
+    if not train_file.exists():
+        return None
+
+    return train_file, test_file, test_complex_file
 
 
 def freeze_layers(model: MathTransformer, start_layer: int, end_layer: int):
@@ -260,13 +302,122 @@ def freeze_layers(model: MathTransformer, start_layer: int, end_layer: int):
     print(f"Unfrozen layers: {start_layer}-{end_layer-1} ({end_layer - start_layer}/{num_layers}) | Trainable params: {trainable:,}/{total:,}")
 
 
+def get_layer_lrs_string(base_lr: float, start_layer: int, end_layer: int, lr_profile: list[float]) -> str:
+    """Format layer LRs as string: 'layer_idx:lr,layer_idx:lr,...'"""
+    window_size = end_layer - start_layer
+    parts = []
+    for i in range(start_layer, end_layer):
+        pos_in_window = i - start_layer
+        if window_size <= len(lr_profile):
+            coef = lr_profile[pos_in_window]
+        else:
+            profile_pos = pos_in_window * (len(lr_profile) - 1) / (window_size - 1)
+            low_idx = int(profile_pos)
+            high_idx = min(low_idx + 1, len(lr_profile) - 1)
+            frac = profile_pos - low_idx
+            coef = lr_profile[low_idx] * (1 - frac) + lr_profile[high_idx] * frac
+        layer_lr = base_lr * coef
+        parts.append(f"{i}:{layer_lr:.2e}")
+    return ",".join(parts)
+
+
+def snapshot_layer_weights(model: MathTransformer) -> dict[int, torch.Tensor]:
+    """Create a snapshot of all layer weights (flattened and concatenated)."""
+    snapshots = {}
+    for i, layer in enumerate(model.layers):
+        params = [p.detach().clone().flatten() for p in layer.parameters()]
+        if params:
+            snapshots[i] = torch.cat(params)
+    return snapshots
+
+
+def compute_layer_weight_norms(model: MathTransformer) -> str:
+    """Compute L2 norm of weights for each layer. Format: 'layer_idx:norm,...'"""
+    parts = []
+    for i, layer in enumerate(model.layers):
+        total_sq = 0.0
+        total_count = 0
+        for p in layer.parameters():
+            total_sq += (p.detach() ** 2).sum().item()
+            total_count += p.numel()
+        if total_count > 0:
+            norm = (total_sq / total_count) ** 0.5  # RMS norm
+            parts.append(f"{i}:{norm:.4e}")
+    return ",".join(parts)
+
+
+def compute_layer_weight_rms_changes(
+    model: MathTransformer,
+    prev_snapshots: dict[int, torch.Tensor],
+) -> str:
+    """Compute RMS of weight changes for each layer. Format: 'layer_idx:rms,...'"""
+    parts = []
+    for i, layer in enumerate(model.layers):
+        if i not in prev_snapshots:
+            continue
+        params = [p.detach().flatten() for p in layer.parameters()]
+        if params:
+            current = torch.cat(params)
+            prev = prev_snapshots[i].to(current.device)
+            diff = current - prev
+            rms = (diff ** 2).mean().sqrt().item()
+            parts.append(f"{i}:{rms:.4e}")
+    return ",".join(parts)
+
+
+def create_optimizer_with_lr_profile(
+    model: MathTransformer,
+    base_lr: float,
+    start_layer: int,
+    end_layer: int,
+    lr_profile: list[float],
+) -> torch.optim.AdamW:
+    """
+    Create optimizer with per-layer learning rates based on lr_profile.
+
+    Layers in the unfrozen window get LR = base_lr * profile_coefficient.
+    Embeddings and output use base_lr.
+    """
+    param_groups = []
+    window_size = end_layer - start_layer
+
+    # Embeddings and output - use base LR
+    embedding_params = list(model.token_embedding.parameters())
+    norm_params = list(model.norm.parameters())
+    output_params = list(model.output.parameters())
+    non_layer_params = embedding_params + norm_params + output_params
+    if non_layer_params:
+        param_groups.append({"params": non_layer_params, "lr": base_lr})
+
+    # Transformer layers with profiled LR
+    for i in range(start_layer, end_layer):
+        layer = model.layers[i]
+        layer_params = [p for p in layer.parameters() if p.requires_grad]
+        if layer_params:
+            # Position in window (0 = bottom/start_layer)
+            pos_in_window = i - start_layer
+            # Get profile coefficient, interpolate if window size differs from profile
+            if window_size <= len(lr_profile):
+                coef = lr_profile[pos_in_window]
+            else:
+                # Interpolate profile for larger windows
+                profile_pos = pos_in_window * (len(lr_profile) - 1) / (window_size - 1)
+                low_idx = int(profile_pos)
+                high_idx = min(low_idx + 1, len(lr_profile) - 1)
+                frac = profile_pos - low_idx
+                coef = lr_profile[low_idx] * (1 - frac) + lr_profile[high_idx] * frac
+
+            layer_lr = base_lr * coef
+            param_groups.append({"params": layer_params, "lr": layer_lr})
+
+    return torch.optim.AdamW(param_groups)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train until convergence")
-    parser.add_argument("--train", type=Path, default=Path("data/examples.jsonl"), help="Training data")
-    parser.add_argument("--test", type=Path, default=Path("data/test.jsonl"), help="Test data")
-    parser.add_argument("--test-complex", type=Path, default=Path("data/test-complex.jsonl"), help="Complex test data")
-    parser.add_argument("--output", type=Path, default=Path("checkpoints/model.pt"), help="Model output")
-    parser.add_argument("--log", type=Path, default=Path("checkpoints/training.tsv"), help="Log file (TSV)")
+    parser.add_argument("-e", "--experiment", type=str, help="Experiment name (uses data/exp-{name}/ and checkpoints/exp-{name}/)")
+    parser.add_argument("--output", type=Path, default=Path("model.pt"), help="Model output filename")
+    parser.add_argument("--log", type=Path, default=Path("training.tsv"), help="Log filename (TSV)")
     parser.add_argument("--threshold", type=float, default=0.001, help="Target test loss")
     parser.add_argument("--max-epochs", type=int, default=10000, help="Max epochs")
     parser.add_argument("--eval-interval", type=int, default=1, help="Evaluate every N epochs")
@@ -278,8 +429,19 @@ def main():
     parser.add_argument("--device", default="auto", help="Device")
     parser.add_argument("-c", "--checkpoint", type=Path, help="Resume from checkpoint")
     parser.add_argument("--unfreeze-epochs", type=int, default=0, help="Epochs per layer unfreeze (0 = all unfrozen)")
-    parser.add_argument("--max-unfrozen", type=int, default=8, help="Max unfrozen layers (sliding window, 0 = no limit)")
+    parser.add_argument("--max-unfrozen", type=int, default=10, help="Max unfrozen layers (sliding window, 0 = no limit)")
+    parser.add_argument("--difficulty-threshold", type=float, default=1e-4, help="Train loss threshold to advance difficulty")
     args = parser.parse_args()
+
+    # Resolve paths with experiment subdirectory
+    exp_name = args.experiment or "default"
+    exp_dir = f"exp-{exp_name}"
+    data_dir = Path("data") / exp_dir
+    checkpoint_dir = Path("checkpoints") / exp_dir
+    print(f"Experiment: {exp_name} ({exp_dir})")
+
+    args.output = checkpoint_dir / args.output
+    args.log = checkpoint_dir / args.log
 
     # Ensure output directory exists
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -291,44 +453,63 @@ def main():
         device = torch.device(args.device)
     print(f"Device: {device}")
 
+    # Load LR profile
+    lr_profile = load_lr_profile()
+    print(f"LR profile: {len(lr_profile)} coefficients loaded")
+
     # Tokenizer
     tokenizer = CharTokenizer()
     print(f"Vocab size: {tokenizer.vocab_size}")
 
-    # Datasets
-    def load_train_data(layer_idx: int) -> DataLoader:
-        train_file = get_train_file(args.train, layer_idx)
-        dataset = MathDataset(train_file, tokenizer)
-        print(f"Train data: {train_file} ({len(dataset)} examples)")
-        return DataLoader(
-            dataset,
+    # Difficulty-based data loading
+    def load_difficulty_data(difficulty: int) -> tuple[DataLoader, DataLoader, DataLoader | None] | None:
+        """Load train, test, test-complex loaders for given difficulty. Returns None if no data."""
+        files = get_difficulty_files(data_dir, difficulty)
+        if files is None:
+            return None
+
+        train_file, test_file, test_complex_file = files
+
+        train_dataset = MathDataset(train_file, tokenizer)
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
         )
+        print(f"Difficulty {difficulty}: train={train_file} ({len(train_dataset)} examples)")
 
-    train_loader = load_train_data(0)
+        test_loader = None
+        if test_file.exists():
+            test_dataset = MathDataset(test_file, tokenizer)
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+            )
+            print(f"Difficulty {difficulty}: test={test_file} ({len(test_dataset)} examples)")
 
-    test_dataset = MathDataset(args.test, tokenizer)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
-    )
-    print(f"Test examples: {len(test_dataset)}")
+        test_complex_loader = None
+        if test_complex_file.exists():
+            test_complex_dataset = MathDataset(test_complex_file, tokenizer)
+            test_complex_loader = DataLoader(
+                test_complex_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+            )
+            print(f"Difficulty {difficulty}: test-complex={test_complex_file} ({len(test_complex_dataset)} examples)")
 
-    # Complex test dataset (optional)
-    test_complex_loader = None
-    if args.test_complex.exists():
-        test_complex_dataset = MathDataset(args.test_complex, tokenizer)
-        test_complex_loader = DataLoader(
-            test_complex_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
-        )
-        print(f"Test complex examples: {len(test_complex_dataset)}")
+        return train_loader, test_loader, test_complex_loader
+
+    # Initial difficulty
+    difficulty = 0
+    loaders = load_difficulty_data(difficulty)
+    if loaders is None:
+        print(f"Error: No data files for difficulty {difficulty}")
+        return
+    train_loader, test_loader, test_complex_loader = loaders
 
     # Model
     model = MathTransformer(
@@ -357,22 +538,25 @@ def main():
         end_layer = num_layers
         window_size = num_layers
 
-    # Optimizer (only trainable params)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    # Optimizer with per-layer LR profile
+    optimizer = create_optimizer_with_lr_profile(model, args.lr, start_layer, end_layer, lr_profile)
 
     # Training config
     print(f"\nConfig:")
     print(f"  threshold: {args.threshold}")
+    print(f"  difficulty_threshold: {args.difficulty_threshold}")
     print(f"  eval_interval: {args.eval_interval}")
     print(f"  weight_reasoning: {args.weight_reasoning}")
     print(f"  weight_answer: {args.weight_answer}")
     print(f"  weight_format: {args.weight_format}")
     print(f"  unfreeze_epochs: {args.unfreeze_epochs}")
     print(f"  max_unfrozen: {args.max_unfrozen} (window_size: {window_size})")
+    print(f"  base_lr: {args.lr}")
+    print(f"  lr_profile: {lr_profile}")
     print()
 
     # Training loop
-    current_layer_idx = 0
+    last_train_loss_answer = float("inf")
     for epoch in range(1, args.max_epochs + 1):
         # Check if we need to slide the unfrozen window
         if args.unfreeze_epochs > 0 and end_layer < num_layers:
@@ -383,17 +567,31 @@ def main():
                 print(f"Saved layer checkpoint: {layer_checkpoint}")
 
                 end_layer += 1
-                current_layer_idx = end_layer - 1
                 # Slide window: if we exceed max_unfrozen, move start_layer up
                 if end_layer - start_layer > window_size:
                     start_layer += 1
                 freeze_layers(model, start_layer, end_layer)
-                # Reload training data for new layer
-                train_loader = load_train_data(current_layer_idx)
-                # Recreate optimizer with new trainable params
-                optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+
+                # Check if we can advance difficulty (loss_answer below threshold)
+                if last_train_loss_answer < args.difficulty_threshold:
+                    new_difficulty = difficulty + 1
+                    new_loaders = load_difficulty_data(new_difficulty)
+                    if new_loaders is None:
+                        print(f"\nNo data for difficulty {new_difficulty}. Training complete.")
+                        break
+                    difficulty = new_difficulty
+                    train_loader, test_loader, test_complex_loader = new_loaders
+                    print(f"Advanced to difficulty {difficulty} (loss_a {last_train_loss_answer:.6f} < {args.difficulty_threshold})")
+
+                # Recreate optimizer with new trainable params and LR profile
+                optimizer = create_optimizer_with_lr_profile(model, args.lr, start_layer, end_layer, lr_profile)
+
+        # Snapshot weights before training epoch
+        weight_snapshots = snapshot_layer_weights(model)
+
         model.train()
         total_loss = 0.0
+        max_seq_len = 0
 
         for batch in train_loader:
             optimizer.zero_grad()
@@ -401,6 +599,9 @@ def main():
             input_ids = batch["input_ids"].to(device)
             inputs = input_ids[:, :-1]
             targets = input_ids[:, 1:]
+
+            # Track max sequence length
+            max_seq_len = max(max_seq_len, input_ids.size(1))
 
             logits = model(inputs)
 
@@ -446,14 +647,19 @@ def main():
                 args.weight_format,
                 device,
             )
-            test_metrics = evaluate(
-                model,
-                test_loader,
-                args.weight_reasoning,
-                args.weight_answer,
-                args.weight_format,
-                device,
-            )
+            last_train_loss_answer = train_metrics.loss_answer
+
+            # Evaluate on test set if available
+            test_metrics = None
+            if test_loader is not None:
+                test_metrics = evaluate(
+                    model,
+                    test_loader,
+                    args.weight_reasoning,
+                    args.weight_answer,
+                    args.weight_format,
+                    device,
+                )
 
             # Evaluate on complex test set if available
             test_complex_metrics = None
@@ -469,26 +675,34 @@ def main():
 
             # Print metrics
             line = (
-                f"Epoch {epoch:5d} | "
-                f"Train: {train_metrics.loss_total:.4f} (w:{train_metrics.loss_reasoning:.4f} a:{train_metrics.loss_answer:.4f} acc:{train_metrics.accuracy:.2%}) | "
-                f"Test: {test_metrics.loss_total:.4f} (w:{test_metrics.loss_reasoning:.4f} a:{test_metrics.loss_answer:.4f} acc:{test_metrics.accuracy:.2%})"
+                f"Epoch {epoch:5d} D{difficulty} | "
+                f"Train: {train_metrics.loss_total:.4f} (w:{train_metrics.loss_reasoning:.4f} a:{train_metrics.loss_answer:.4f} acc:{train_metrics.accuracy:.2%})"
             )
+            if test_metrics:
+                line += f" | Test: {test_metrics.loss_total:.4f} (w:{test_metrics.loss_reasoning:.4f} a:{test_metrics.loss_answer:.4f} acc:{test_metrics.accuracy:.2%})"
             if test_complex_metrics:
                 line += f" | Complex: {test_complex_metrics.loss_total:.4f} (acc:{test_complex_metrics.accuracy:.2%})"
-            line += f" | Layers: {start_layer}-{end_layer-1}/{num_layers}"
+            line += f" | Layers: {start_layer}-{end_layer-1}/{num_layers} | MaxSeq: {max_seq_len}"
             print(line)
 
-            log_metrics(args.log, epoch, train_metrics, test_metrics, test_complex_metrics, start_layer, end_layer)
+            layer_lrs = get_layer_lrs_string(args.lr, start_layer, end_layer, lr_profile)
+            layer_weight_norms = compute_layer_weight_norms(model)
+            layer_weight_rms_changes = compute_layer_weight_rms_changes(model, weight_snapshots)
+            log_metrics(
+                args.log, epoch, difficulty, train_metrics, test_metrics, test_complex_metrics,
+                start_layer, end_layer, max_seq_len, layer_lrs,
+                layer_weight_norms, layer_weight_rms_changes,
+            )
 
             # Save checkpoint
             torch.save(model.state_dict(), args.output)
 
-            # Check convergence
-            if test_metrics.loss_total < args.threshold:
+            # Check convergence (only if test_metrics available)
+            if test_metrics and test_metrics.loss_total < args.threshold:
                 print(f"\nConverged! Test loss {test_metrics.loss_total:.6f} < {args.threshold}")
                 break
         else:
-            print(f"Epoch {epoch:5d} | Train loss: {train_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
+            print(f"Epoch {epoch:5d} D{difficulty} | Train loss: {train_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
 
     print(f"\nTraining complete. Model saved to {args.output}")
     print(f"Log saved to {args.log}")

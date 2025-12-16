@@ -209,7 +209,7 @@ def generate_addition_binary_digits(min_digits: int = 1, max_digits: int = 5) ->
 GENERATORS = {
     1: ("addition_no_carry", generate_addition_no_carry, 1, 1),
     2: ("addition_with_carry", generate_addition_with_carry, 0, 1),  # disabled
-    3: ("addition_binary_digits", generate_addition_binary_digits, 1, 3),
+    3: ("addition_binary_digits", generate_addition_binary_digits, 1, 2),
 }
 
 
@@ -253,7 +253,8 @@ def save_examples(examples: list[Example], output_path: Path, append: bool = Fal
 
 def main():
     parser = argparse.ArgumentParser(description="Generate math training examples")
-    parser.add_argument("-o", "--output", type=Path, default=Path("data/examples.jsonl"), help="Output path")
+    parser.add_argument("-e", "--experiment", type=str, help="Experiment name (creates data/{experiment}/ subdir)")
+    parser.add_argument("-o", "--output", type=Path, default=Path("examples.jsonl"), help="Output filename")
     parser.add_argument("-n", "--count", type=int, default=100, help="Number of examples per type")
     parser.add_argument("--min-digits", type=int, default=1, help="Min digits for numbers")
     parser.add_argument("--max-digits", type=int, default=3, help="Max digits for numbers")
@@ -262,6 +263,14 @@ def main():
     parser.add_argument("--append", action="store_true", help="Append to existing file")
     parser.add_argument("--show", action="store_true", help="Print examples to stdout")
     args = parser.parse_args()
+
+    # Resolve output path with experiment subdirectory
+    exp_name = args.experiment or "default"
+    exp_dir = f"exp-{exp_name}"
+    output_dir = Path("data") / exp_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / args.output
+    print(f"Experiment: {exp_name} ({exp_dir})")
 
     # Parse weight overrides
     weight_overrides = {}
@@ -303,8 +312,8 @@ def main():
     random.shuffle(all_examples)
 
     # Save
-    save_examples(all_examples, args.output, append=args.append)
-    print(f"Saved {len(all_examples)} examples to {args.output}")
+    save_examples(all_examples, output_path, append=args.append)
+    print(f"Saved {len(all_examples)} examples to {output_path}")
 
     # Show samples
     if args.show:

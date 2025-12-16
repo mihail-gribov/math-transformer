@@ -1,7 +1,15 @@
 #!/bin/bash
 cd "$(dirname "$0")/.."
-uv run python train_until_converge.py \
-    --train data/examples.jsonl \
-    --test data/test.jsonl \
+
+EXP="${1:-}"
+if [ -n "$EXP" ]; then
+    EXP_ARG="-e $EXP"
+else
+    EXP_ARG=""
+fi
+
+uv run python train_until_converge.py $EXP_ARG \
     --threshold 0.001 \
-    --unfreeze-epochs 4
+    --difficulty-threshold 1e-4 \
+    --unfreeze-epochs 5 \
+    --max-unfrozen 10

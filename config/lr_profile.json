@@ -1,0 +1,15 @@
+{
+    "description": "LR profile coefficients for layers in the sliding window (bottom to top)",
+    "profile": [
+        0.06779661,
+        0.13559322,
+        0.406779661,
+        0.949152542,
+        1.220338983,
+        1.355932203,
+        1.355932203,
+        1.288135593,
+        0.949152542,
+        0.271186441
+    ]
+}
