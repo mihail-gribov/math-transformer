@@ -7,11 +7,16 @@ Type ID indicates difficulty (higher = harder).
 """
 
 import argparse
+import hashlib
 import json
 import random
-import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+
+def make_id(context: str) -> str:
+    """Generate ID as hash of context."""
+    return hashlib.md5(context.encode()).hexdigest()[:8]
 
 
 @dataclass
@@ -73,11 +78,12 @@ def generate_addition_no_carry(min_digits: int = 1, max_digits: int = 3) -> Exam
 
     reasoning = ", ".join(reasoning_parts)
 
+    context = f"{num_a}+{num_b}"
     return Example(
-        id=str(uuid.uuid4())[:8],
+        id=make_id(context),
         type_id=1,
         type_name="addition_no_carry",
-        context=f"{num_a}+{num_b}",
+        context=context,
         reasoning=reasoning,
         answer=str(result),
     )
@@ -136,11 +142,12 @@ def generate_addition_with_carry(min_digits: int = 1, max_digits: int = 3) -> Ex
 
     reasoning = ", ".join(reasoning_parts)
 
+    context = f"{num_a}+{num_b}"
     return Example(
-        id=str(uuid.uuid4())[:8],
+        id=make_id(context),
         type_id=2,
         type_name="addition_with_carry",
-        context=f"{num_a}+{num_b}",
+        context=context,
         reasoning=reasoning,
         answer=str(result),
     )
@@ -187,11 +194,12 @@ def generate_addition_binary_digits(min_digits: int = 1, max_digits: int = 5) ->
 
     reasoning = ", ".join(reasoning_parts)
 
+    context = f"{num_a}+{num_b}"
     return Example(
-        id=str(uuid.uuid4())[:8],
+        id=make_id(context),
         type_id=3,
         type_name="addition_binary_digits",
-        context=f"{num_a}+{num_b}",
+        context=context,
         reasoning=reasoning,
         answer=str(result),
     )
@@ -208,13 +216,29 @@ GENERATORS = {
 def generate_examples(
     generator_fn,
     count: int,
+    seen_ids: set[str] | None = None,
+    max_consecutive_duplicates: int = 1000,
     **kwargs,
 ) -> list[Example]:
-    """Generate multiple examples using given generator."""
+    """Generate multiple unique examples using given generator."""
+    if seen_ids is None:
+        seen_ids = set()
+
     examples = []
-    for _ in range(count):
+    consecutive_duplicates = 0
+
+    while len(examples) < count:
         example = generator_fn(**kwargs)
+        if example.id in seen_ids:
+            consecutive_duplicates += 1
+            if consecutive_duplicates >= max_consecutive_duplicates:
+                print(f"Warning: {consecutive_duplicates} consecutive duplicates, stopping ({len(examples)}/{count})")
+                break
+            continue
+        consecutive_duplicates = 0
+        seen_ids.add(example.id)
         examples.append(example)
+
     return examples
 
 
@@ -250,6 +274,7 @@ def main():
     type_ids = args.types or list(GENERATORS.keys())
 
     all_examples = []
+    seen_ids: set[str] = set()
 
     for type_id in type_ids:
         if type_id not in GENERATORS:
@@ -268,6 +293,7 @@ def main():
         examples = generate_examples(
             generator_fn,
             count=count,
+            seen_ids=seen_ids,
             min_digits=min_digits,
             max_digits=max_digits,
         )

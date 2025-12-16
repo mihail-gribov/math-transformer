@@ -5,6 +5,7 @@ import argparse
 import json
 import torch
 import torch.nn.functional as F
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -14,6 +15,83 @@ from train import MathDataset, collate_fn, create_loss_weights
 from generate import CharTokenizer
 
 
+@dataclass
+class EvalMetrics:
+    """Evaluation metrics."""
+
+    loss_total: float
+    loss_reasoning: float
+    loss_answer: float
+    accuracy: float  # Exact match on answer
+
+
+def compute_separate_losses(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    reasoning_ranges: list[tuple[int, int]],
+    answer_ranges: list[tuple[int, int]],
+) -> tuple[float, float]:
+    """Compute separate losses for reasoning and answer parts."""
+    batch_size, seq_len = targets.shape
+    device = logits.device
+
+    loss_per_token = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        reduction="none",
+    ).reshape(batch_size, seq_len)
+
+    reasoning_loss_sum = 0.0
+    reasoning_count = 0
+    answer_loss_sum = 0.0
+    answer_count = 0
+
+    for b in range(batch_size):
+        r_start, r_end = reasoning_ranges[b]
+        # Shift by -1 because targets are shifted
+        r_start_t, r_end_t = max(0, r_start - 1), max(0, r_end - 1)
+        if r_end_t > r_start_t and r_end_t <= seq_len:
+            reasoning_loss_sum += loss_per_token[b, r_start_t:r_end_t].sum().item()
+            reasoning_count += r_end_t - r_start_t
+
+        a_start, a_end = answer_ranges[b]
+        a_start_t, a_end_t = max(0, a_start - 1), max(0, a_end - 1)
+        if a_end_t > a_start_t and a_end_t <= seq_len:
+            answer_loss_sum += loss_per_token[b, a_start_t:a_end_t].sum().item()
+            answer_count += a_end_t - a_start_t
+
+    loss_reasoning = reasoning_loss_sum / reasoning_count if reasoning_count > 0 else 0.0
+    loss_answer = answer_loss_sum / answer_count if answer_count > 0 else 0.0
+
+    return loss_reasoning, loss_answer
+
+
+def compute_accuracy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    answer_ranges: list[tuple[int, int]],
+) -> float:
+    """Compute exact match accuracy on answer part."""
+    batch_size, seq_len = targets.shape
+    predictions = logits.argmax(dim=-1)
+
+    correct = 0
+    total = 0
+
+    for b in range(batch_size):
+        a_start, a_end = answer_ranges[b]
+        # Shift by -1 because targets are shifted
+        a_start_t, a_end_t = max(0, a_start - 1), max(0, a_end - 1)
+        if a_end_t > a_start_t and a_end_t <= seq_len:
+            pred_answer = predictions[b, a_start_t:a_end_t]
+            true_answer = targets[b, a_start_t:a_end_t]
+            if torch.equal(pred_answer, true_answer):
+                correct += 1
+            total += 1
+
+    return correct / total if total > 0 else 0.0
+
+
 def evaluate(
     model: MathTransformer,
     dataloader: DataLoader,
@@ -21,10 +99,14 @@ def evaluate(
     weight_answer: float,
     weight_format: float,
     device: torch.device,
-) -> float:
-    """Evaluate model on dataset, return average loss."""
+) -> EvalMetrics:
+    """Evaluate model on dataset, return metrics."""
     model.eval()
     total_loss = 0.0
+    total_loss_reasoning = 0.0
+    total_loss_answer = 0.0
+    total_correct = 0
+    total_examples = 0
     total_batches = 0
 
     with torch.no_grad():
@@ -60,31 +142,86 @@ def evaluate(
                 loss = weighted_loss
 
             total_loss += loss.item()
+
+            # Compute separate losses
+            loss_r, loss_a = compute_separate_losses(
+                logits, targets, batch["reasoning_ranges"], batch["answer_ranges"]
+            )
+            total_loss_reasoning += loss_r
+            total_loss_answer += loss_a
+
+            # Compute accuracy
+            acc = compute_accuracy(logits, targets, batch["answer_ranges"])
+            total_correct += acc * len(batch["answer_ranges"])
+            total_examples += len(batch["answer_ranges"])
+
             total_batches += 1
 
-    return total_loss / total_batches if total_batches > 0 else 0.0
+    return EvalMetrics(
+        loss_total=total_loss / total_batches if total_batches > 0 else 0.0,
+        loss_reasoning=total_loss_reasoning / total_batches if total_batches > 0 else 0.0,
+        loss_answer=total_loss_answer / total_batches if total_batches > 0 else 0.0,
+        accuracy=total_correct / total_examples if total_examples > 0 else 0.0,
+    )
+
+
+TSV_COLUMNS = [
+    "timestamp",
+    "epoch",
+    "unfrozen_start",
+    "unfrozen_end",
+    "train_loss",
+    "train_loss_w",
+    "train_loss_a",
+    "train_acc",
+    "test_loss",
+    "test_loss_w",
+    "test_loss_a",
+    "test_acc",
+    "complex_loss",
+    "complex_loss_w",
+    "complex_loss_a",
+    "complex_acc",
+]
 
 
 def log_metrics(
     log_path: Path,
     epoch: int,
-    train_loss: float,
-    test_loss: float | None,
+    train_metrics: EvalMetrics,
+    test_metrics: EvalMetrics | None,
+    test_complex_metrics: EvalMetrics | None = None,
     start_layer: int | None = None,
     end_layer: int | None = None,
 ):
-    """Append metrics to log file."""
+    """Append metrics to TSV log file."""
+    # Write header if file doesn't exist
+    write_header = not log_path.exists()
+
     timestamp = datetime.now().isoformat(timespec="seconds")
-    entry = {
-        "timestamp": timestamp,
-        "epoch": epoch,
-        "train_loss": train_loss,
-        "test_loss": test_loss,
-        "unfrozen_start": start_layer,
-        "unfrozen_end": end_layer,
-    }
+    values = [
+        timestamp,
+        epoch,
+        start_layer if start_layer is not None else "",
+        end_layer if end_layer is not None else "",
+        f"{train_metrics.loss_total:.6f}",
+        f"{train_metrics.loss_reasoning:.6f}",
+        f"{train_metrics.loss_answer:.6f}",
+        f"{train_metrics.accuracy:.4f}",
+        f"{test_metrics.loss_total:.6f}" if test_metrics else "",
+        f"{test_metrics.loss_reasoning:.6f}" if test_metrics else "",
+        f"{test_metrics.loss_answer:.6f}" if test_metrics else "",
+        f"{test_metrics.accuracy:.4f}" if test_metrics else "",
+        f"{test_complex_metrics.loss_total:.6f}" if test_complex_metrics else "",
+        f"{test_complex_metrics.loss_reasoning:.6f}" if test_complex_metrics else "",
+        f"{test_complex_metrics.loss_answer:.6f}" if test_complex_metrics else "",
+        f"{test_complex_metrics.accuracy:.4f}" if test_complex_metrics else "",
+    ]
+
     with open(log_path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+        if write_header:
+            f.write("\t".join(TSV_COLUMNS) + "\n")
+        f.write("\t".join(str(v) for v in values) + "\n")
 
 
 def get_train_file(base_path: Path, layer_idx: int) -> Path:
@@ -127,8 +264,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train until convergence")
     parser.add_argument("--train", type=Path, default=Path("data/examples.jsonl"), help="Training data")
     parser.add_argument("--test", type=Path, default=Path("data/test.jsonl"), help="Test data")
+    parser.add_argument("--test-complex", type=Path, default=Path("data/test-complex.jsonl"), help="Complex test data")
     parser.add_argument("--output", type=Path, default=Path("checkpoints/model.pt"), help="Model output")
-    parser.add_argument("--log", type=Path, default=Path("checkpoints/training.log"), help="Log file")
+    parser.add_argument("--log", type=Path, default=Path("checkpoints/training.tsv"), help="Log file (TSV)")
     parser.add_argument("--threshold", type=float, default=0.001, help="Target test loss")
     parser.add_argument("--max-epochs", type=int, default=10000, help="Max epochs")
     parser.add_argument("--eval-interval", type=int, default=1, help="Evaluate every N epochs")
@@ -180,6 +318,18 @@ def main():
     )
     print(f"Test examples: {len(test_dataset)}")
 
+    # Complex test dataset (optional)
+    test_complex_loader = None
+    if args.test_complex.exists():
+        test_complex_dataset = MathDataset(args.test_complex, tokenizer)
+        test_complex_loader = DataLoader(
+            test_complex_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+        )
+        print(f"Test complex examples: {len(test_complex_dataset)}")
+
     # Model
     model = MathTransformer(
         vocab_size=tokenizer.vocab_size,
@@ -227,6 +377,11 @@ def main():
         # Check if we need to slide the unfrozen window
         if args.unfreeze_epochs > 0 and end_layer < num_layers:
             if epoch > 1 and (epoch - 1) % args.unfreeze_epochs == 0:
+                # Save checkpoint before adding new layer
+                layer_checkpoint = args.output.parent / f"{args.output.stem}-layer{end_layer-1}{args.output.suffix}"
+                torch.save(model.state_dict(), layer_checkpoint)
+                print(f"Saved layer checkpoint: {layer_checkpoint}")
+
                 end_layer += 1
                 current_layer_idx = end_layer - 1
                 # Slide window: if we exceed max_unfrozen, move start_layer up
@@ -281,9 +436,17 @@ def main():
 
         train_loss = total_loss / len(train_loader)
 
-        # Evaluate on test set
+        # Evaluate on train and test sets
         if epoch % args.eval_interval == 0:
-            test_loss = evaluate(
+            train_metrics = evaluate(
+                model,
+                train_loader,
+                args.weight_reasoning,
+                args.weight_answer,
+                args.weight_format,
+                device,
+            )
+            test_metrics = evaluate(
                 model,
                 test_loader,
                 args.weight_reasoning,
@@ -292,19 +455,40 @@ def main():
                 device,
             )
 
-            print(f"Epoch {epoch:5d} | Train: {train_loss:.6f} | Test: {test_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
-            log_metrics(args.log, epoch, train_loss, test_loss, start_layer, end_layer)
+            # Evaluate on complex test set if available
+            test_complex_metrics = None
+            if test_complex_loader is not None:
+                test_complex_metrics = evaluate(
+                    model,
+                    test_complex_loader,
+                    args.weight_reasoning,
+                    args.weight_answer,
+                    args.weight_format,
+                    device,
+                )
+
+            # Print metrics
+            line = (
+                f"Epoch {epoch:5d} | "
+                f"Train: {train_metrics.loss_total:.4f} (w:{train_metrics.loss_reasoning:.4f} a:{train_metrics.loss_answer:.4f} acc:{train_metrics.accuracy:.2%}) | "
+                f"Test: {test_metrics.loss_total:.4f} (w:{test_metrics.loss_reasoning:.4f} a:{test_metrics.loss_answer:.4f} acc:{test_metrics.accuracy:.2%})"
+            )
+            if test_complex_metrics:
+                line += f" | Complex: {test_complex_metrics.loss_total:.4f} (acc:{test_complex_metrics.accuracy:.2%})"
+            line += f" | Layers: {start_layer}-{end_layer-1}/{num_layers}"
+            print(line)
+
+            log_metrics(args.log, epoch, train_metrics, test_metrics, test_complex_metrics, start_layer, end_layer)
 
             # Save checkpoint
             torch.save(model.state_dict(), args.output)
 
             # Check convergence
-            if test_loss < args.threshold:
-                print(f"\nConverged! Test loss {test_loss:.6f} < {args.threshold}")
+            if test_metrics.loss_total < args.threshold:
+                print(f"\nConverged! Test loss {test_metrics.loss_total:.6f} < {args.threshold}")
                 break
         else:
-            print(f"Epoch {epoch:5d} | Train: {train_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
-            log_metrics(args.log, epoch, train_loss, None, start_layer, end_layer)
+            print(f"Epoch {epoch:5d} | Train loss: {train_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
 
     print(f"\nTraining complete. Model saved to {args.output}")
     print(f"Log saved to {args.log}")
