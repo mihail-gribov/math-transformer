@@ -2,7 +2,6 @@
 """Training script that trains until test loss converges below threshold."""
 
 import argparse
-import json
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -13,15 +12,6 @@ from torch.utils.data import DataLoader
 from model import MathTransformer
 from train import MathDataset, collate_fn, create_loss_weights
 from generate import CharTokenizer
-
-
-def load_lr_profile(config_path: Path = Path("config/lr_profile.json")) -> list[float]:
-    """Load LR profile from config file."""
-    if not config_path.exists():
-        raise FileNotFoundError(f"LR profile config not found: {config_path}")
-    with open(config_path) as f:
-        config = json.load(f)
-    return config["profile"]
 
 
 @dataclass
@@ -192,10 +182,7 @@ TSV_COLUMNS = [
     "timestamp",
     "epoch",
     "difficulty",
-    "unfrozen_start",
-    "unfrozen_end",
     "max_seq_len",
-    "layer_lrs",
     "layer_weight_norms",
     "layer_weight_rms_changes",
     "train_loss",
@@ -220,10 +207,7 @@ def log_metrics(
     train_metrics: EvalMetrics,
     test_metrics: EvalMetrics | None,
     test_complex_metrics: EvalMetrics | None = None,
-    start_layer: int | None = None,
-    end_layer: int | None = None,
     max_seq_len: int = 0,
-    layer_lrs: str = "",
     layer_weight_norms: str = "",
     layer_weight_rms_changes: str = "",
 ):
@@ -236,10 +220,7 @@ def log_metrics(
         timestamp,
         epoch,
         difficulty,
-        start_layer if start_layer is not None else "",
-        end_layer if end_layer is not None else "",
         max_seq_len,
-        layer_lrs,
         layer_weight_norms,
         layer_weight_rms_changes,
         f"{train_metrics.loss_total:.6f}",
@@ -276,52 +257,6 @@ def get_difficulty_files(data_dir: Path, difficulty: int) -> tuple[Path, Path, P
         return None
 
     return train_file, test_file, test_complex_file
-
-
-def freeze_layers(model: MathTransformer, start_layer: int, end_layer: int):
-    """
-    Freeze all layers except those in range [start_layer, end_layer).
-
-    Embeddings and output are always trainable.
-    """
-    # Unfreeze embeddings and output
-    model.token_embedding.requires_grad_(True)
-    model.norm.requires_grad_(True)
-    model.output.requires_grad_(True)
-
-    # Freeze/unfreeze transformer layers
-    num_layers = len(model.layers)
-    for i, layer in enumerate(model.layers):
-        if start_layer <= i < end_layer:
-            layer.requires_grad_(True)
-        else:
-            layer.requires_grad_(False)
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Unfrozen layers: {start_layer}-{end_layer-1} ({end_layer - start_layer}/{num_layers}) | Trainable params: {trainable:,}/{total:,}")
-
-
-def get_layer_lrs_string(base_lr: float, start_layer: int, end_layer: int, lr_profile: list[float]) -> str:
-    """Format layer LRs as string: 'layer_idx:lr,layer_idx:lr,...'
-
-    Profile is read from the end: newest layer gets profile[-1],
-    next layer gets profile[-2], etc. Profile slides with the window.
-    """
-    window_size = end_layer - start_layer
-    profile_len = len(lr_profile)
-    parts = []
-    for i in range(start_layer, end_layer):
-        # Index from end: newest (end_layer-1) → profile[-1], etc.
-        profile_idx = profile_len - (end_layer - i)
-        if profile_idx >= 0:
-            coef = lr_profile[profile_idx]
-        else:
-            # Window larger than profile - use first element for oldest layers
-            coef = lr_profile[0]
-        layer_lr = base_lr * coef
-        parts.append(f"{i}:{layer_lr:.2e}")
-    return ",".join(parts)
 
 
 def snapshot_layer_weights(model: MathTransformer) -> dict[int, torch.Tensor]:
@@ -368,51 +303,6 @@ def compute_layer_weight_rms_changes(
     return ",".join(parts)
 
 
-def create_optimizer_with_lr_profile(
-    model: MathTransformer,
-    base_lr: float,
-    start_layer: int,
-    end_layer: int,
-    lr_profile: list[float],
-) -> torch.optim.AdamW:
-    """
-    Create optimizer with per-layer learning rates based on lr_profile.
-
-    Layers in the unfrozen window get LR = base_lr * profile_coefficient.
-    Embeddings and output use base_lr.
-    """
-    param_groups = []
-    window_size = end_layer - start_layer
-
-    # Embeddings and output - use base LR
-    embedding_params = list(model.token_embedding.parameters())
-    norm_params = list(model.norm.parameters())
-    output_params = list(model.output.parameters())
-    non_layer_params = embedding_params + norm_params + output_params
-    if non_layer_params:
-        param_groups.append({"params": non_layer_params, "lr": base_lr})
-
-    # Transformer layers with profiled LR
-    # Profile is read from the end: newest layer gets profile[-1], etc.
-    profile_len = len(lr_profile)
-    for i in range(start_layer, end_layer):
-        layer = model.layers[i]
-        layer_params = [p for p in layer.parameters() if p.requires_grad]
-        if layer_params:
-            # Index from end: newest (end_layer-1) → profile[-1], etc.
-            profile_idx = profile_len - (end_layer - i)
-            if profile_idx >= 0:
-                coef = lr_profile[profile_idx]
-            else:
-                # Window larger than profile - use first element for oldest layers
-                coef = lr_profile[0]
-
-            layer_lr = base_lr * coef
-            param_groups.append({"params": layer_params, "lr": layer_lr})
-
-    return torch.optim.AdamW(param_groups)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Train until convergence")
     parser.add_argument("-e", "--experiment", type=str, help="Experiment name (uses data/exp-{name}/ and checkpoints/exp-{name}/)")
@@ -428,9 +318,8 @@ def main():
     parser.add_argument("--weight-format", type=float, default=2.0, help="Loss weight for format")
     parser.add_argument("--device", default="auto", help="Device")
     parser.add_argument("-c", "--checkpoint", type=Path, help="Resume from checkpoint")
-    parser.add_argument("--unfreeze-epochs", type=int, default=0, help="Epochs per layer unfreeze (0 = all unfrozen)")
-    parser.add_argument("--max-unfrozen", type=int, default=10, help="Max unfrozen layers (sliding window, 0 = no limit)")
     parser.add_argument("--difficulty-threshold", type=float, default=1e-3, help="Train loss threshold to advance difficulty")
+    parser.add_argument("--difficulty-epochs", type=int, default=5, help="Epochs between difficulty checks")
     args = parser.parse_args()
 
     # Resolve paths with experiment subdirectory
@@ -452,10 +341,6 @@ def main():
     else:
         device = torch.device(args.device)
     print(f"Device: {device}")
-
-    # Load LR profile
-    lr_profile = load_lr_profile()
-    print(f"LR profile: {len(lr_profile)} coefficients loaded")
 
     # Tokenizer
     tokenizer = CharTokenizer()
@@ -523,68 +408,39 @@ def main():
         model.load_state_dict(torch.load(args.checkpoint, map_location=device, weights_only=True))
         print(f"Loaded checkpoint: {args.checkpoint}")
 
-    params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {params:,}")
-
-    # Gradual unfreezing setup
     num_layers = len(model.layers)
-    if args.unfreeze_epochs > 0:
-        start_layer = 0
-        window_size = args.max_unfrozen if args.max_unfrozen > 0 else num_layers
-        end_layer = min(1, num_layers)  # Start with 1 layer
-        freeze_layers(model, start_layer, end_layer)
-    else:
-        start_layer = 0
-        end_layer = num_layers
-        window_size = num_layers
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {params:,} ({num_layers} layers)")
 
-    # Optimizer with per-layer LR profile
-    optimizer = create_optimizer_with_lr_profile(model, args.lr, start_layer, end_layer, lr_profile)
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Training config
     print(f"\nConfig:")
     print(f"  threshold: {args.threshold}")
     print(f"  difficulty_threshold: {args.difficulty_threshold}")
+    print(f"  difficulty_epochs: {args.difficulty_epochs}")
     print(f"  eval_interval: {args.eval_interval}")
     print(f"  weight_reasoning: {args.weight_reasoning}")
     print(f"  weight_answer: {args.weight_answer}")
     print(f"  weight_format: {args.weight_format}")
-    print(f"  unfreeze_epochs: {args.unfreeze_epochs}")
-    print(f"  max_unfrozen: {args.max_unfrozen} (window_size: {window_size})")
-    print(f"  base_lr: {args.lr}")
-    print(f"  lr_profile: {lr_profile}")
+    print(f"  lr: {args.lr}")
     print()
 
     # Training loop
     last_train_loss_answer = float("inf")
     for epoch in range(1, args.max_epochs + 1):
-        # Check if we need to slide the unfrozen window
-        if args.unfreeze_epochs > 0 and end_layer < num_layers:
-            if epoch > 1 and (epoch - 1) % args.unfreeze_epochs == 0:
-                # Save checkpoint before adding new layer
-                layer_checkpoint = args.output.parent / f"{args.output.stem}-layer{end_layer-1}{args.output.suffix}"
-                torch.save(model.state_dict(), layer_checkpoint)
-                print(f"Saved layer checkpoint: {layer_checkpoint}")
-
-                end_layer += 1
-                # Slide window: if we exceed max_unfrozen, move start_layer up
-                if end_layer - start_layer > window_size:
-                    start_layer += 1
-                freeze_layers(model, start_layer, end_layer)
-
-                # Check if we can advance difficulty (loss_answer below threshold)
-                if last_train_loss_answer < args.difficulty_threshold:
-                    new_difficulty = difficulty + 1
-                    new_loaders = load_difficulty_data(new_difficulty)
-                    if new_loaders is None:
-                        print(f"\nNo data for difficulty {new_difficulty}. Training complete.")
-                        break
-                    difficulty = new_difficulty
-                    train_loader, test_loader, test_complex_loader = new_loaders
-                    print(f"Advanced to difficulty {difficulty} (loss_a {last_train_loss_answer:.6f} < {args.difficulty_threshold})")
-
-                # Recreate optimizer with new trainable params and LR profile
-                optimizer = create_optimizer_with_lr_profile(model, args.lr, start_layer, end_layer, lr_profile)
+        # Check if we can advance difficulty
+        if epoch > 1 and (epoch - 1) % args.difficulty_epochs == 0:
+            if last_train_loss_answer < args.difficulty_threshold:
+                new_difficulty = difficulty + 1
+                new_loaders = load_difficulty_data(new_difficulty)
+                if new_loaders is None:
+                    print(f"\nNo data for difficulty {new_difficulty}. Training complete.")
+                    break
+                difficulty = new_difficulty
+                train_loader, test_loader, test_complex_loader = new_loaders
+                print(f"Advanced to difficulty {difficulty} (loss_a {last_train_loss_answer:.6f} < {args.difficulty_threshold})")
 
         # Snapshot weights before training epoch
         weight_snapshots = snapshot_layer_weights(model)
@@ -682,16 +538,16 @@ def main():
                 line += f" | Test: {test_metrics.loss_total:.4f} (w:{test_metrics.loss_reasoning:.4f} a:{test_metrics.loss_answer:.4f} acc:{test_metrics.accuracy:.2%})"
             if test_complex_metrics:
                 line += f" | Complex: {test_complex_metrics.loss_total:.4f} (acc:{test_complex_metrics.accuracy:.2%})"
-            line += f" | Layers: {start_layer}-{end_layer-1}/{num_layers} | MaxSeq: {max_seq_len}"
+            line += f" | MaxSeq: {max_seq_len}"
             print(line)
 
-            layer_lrs = get_layer_lrs_string(args.lr, start_layer, end_layer, lr_profile)
             layer_weight_norms = compute_layer_weight_norms(model)
             layer_weight_rms_changes = compute_layer_weight_rms_changes(model, weight_snapshots)
             log_metrics(
                 args.log, epoch, difficulty, train_metrics, test_metrics, test_complex_metrics,
-                start_layer, end_layer, max_seq_len, layer_lrs,
-                layer_weight_norms, layer_weight_rms_changes,
+                max_seq_len=max_seq_len,
+                layer_weight_norms=layer_weight_norms,
+                layer_weight_rms_changes=layer_weight_rms_changes,
             )
 
             # Save checkpoint
@@ -702,7 +558,7 @@ def main():
                 print(f"\nConverged! Test loss {test_metrics.loss_total:.6f} < {args.threshold}")
                 break
         else:
-            print(f"Epoch {epoch:5d} D{difficulty} | Train loss: {train_loss:.6f} | Layers: {start_layer}-{end_layer-1}/{num_layers}")
+            print(f"Epoch {epoch:5d} D{difficulty} | Train loss: {train_loss:.6f}")
 
     print(f"\nTraining complete. Model saved to {args.output}")
     print(f"Log saved to {args.log}")
