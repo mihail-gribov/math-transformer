@@ -10,6 +10,6 @@ fi
 
 uv run python train_until_converge.py $EXP_ARG \
     --threshold 0.001 \
-    --difficulty-threshold 1e-4 \
+    --difficulty-threshold 1e-3 \
     --unfreeze-epochs 5 \
     --max-unfrozen 10

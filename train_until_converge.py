@@ -303,19 +303,22 @@ def freeze_layers(model: MathTransformer, start_layer: int, end_layer: int):
 
 
 def get_layer_lrs_string(base_lr: float, start_layer: int, end_layer: int, lr_profile: list[float]) -> str:
-    """Format layer LRs as string: 'layer_idx:lr,layer_idx:lr,...'"""
+    """Format layer LRs as string: 'layer_idx:lr,layer_idx:lr,...'
+
+    Profile is read from the end: newest layer gets profile[-1],
+    next layer gets profile[-2], etc. Profile slides with the window.
+    """
     window_size = end_layer - start_layer
+    profile_len = len(lr_profile)
     parts = []
     for i in range(start_layer, end_layer):
-        pos_in_window = i - start_layer
-        if window_size <= len(lr_profile):
-            coef = lr_profile[pos_in_window]
+        # Index from end: newest (end_layer-1) → profile[-1], etc.
+        profile_idx = profile_len - (end_layer - i)
+        if profile_idx >= 0:
+            coef = lr_profile[profile_idx]
         else:
-            profile_pos = pos_in_window * (len(lr_profile) - 1) / (window_size - 1)
-            low_idx = int(profile_pos)
-            high_idx = min(low_idx + 1, len(lr_profile) - 1)
-            frac = profile_pos - low_idx
-            coef = lr_profile[low_idx] * (1 - frac) + lr_profile[high_idx] * frac
+            # Window larger than profile - use first element for oldest layers
+            coef = lr_profile[0]
         layer_lr = base_lr * coef
         parts.append(f"{i}:{layer_lr:.2e}")
     return ",".join(parts)
@@ -390,22 +393,19 @@ def create_optimizer_with_lr_profile(
         param_groups.append({"params": non_layer_params, "lr": base_lr})
 
     # Transformer layers with profiled LR
+    # Profile is read from the end: newest layer gets profile[-1], etc.
+    profile_len = len(lr_profile)
     for i in range(start_layer, end_layer):
         layer = model.layers[i]
         layer_params = [p for p in layer.parameters() if p.requires_grad]
         if layer_params:
-            # Position in window (0 = bottom/start_layer)
-            pos_in_window = i - start_layer
-            # Get profile coefficient, interpolate if window size differs from profile
-            if window_size <= len(lr_profile):
-                coef = lr_profile[pos_in_window]
+            # Index from end: newest (end_layer-1) → profile[-1], etc.
+            profile_idx = profile_len - (end_layer - i)
+            if profile_idx >= 0:
+                coef = lr_profile[profile_idx]
             else:
-                # Interpolate profile for larger windows
-                profile_pos = pos_in_window * (len(lr_profile) - 1) / (window_size - 1)
-                low_idx = int(profile_pos)
-                high_idx = min(low_idx + 1, len(lr_profile) - 1)
-                frac = profile_pos - low_idx
-                coef = lr_profile[low_idx] * (1 - frac) + lr_profile[high_idx] * frac
+                # Window larger than profile - use first element for oldest layers
+                coef = lr_profile[0]
 
             layer_lr = base_lr * coef
             param_groups.append({"params": layer_params, "lr": layer_lr})
@@ -430,7 +430,7 @@ def main():
     parser.add_argument("-c", "--checkpoint", type=Path, help="Resume from checkpoint")
     parser.add_argument("--unfreeze-epochs", type=int, default=0, help="Epochs per layer unfreeze (0 = all unfrozen)")
     parser.add_argument("--max-unfrozen", type=int, default=10, help="Max unfrozen layers (sliding window, 0 = no limit)")
-    parser.add_argument("--difficulty-threshold", type=float, default=1e-4, help="Train loss threshold to advance difficulty")
+    parser.add_argument("--difficulty-threshold", type=float, default=1e-3, help="Train loss threshold to advance difficulty")
     args = parser.parse_args()
 
     # Resolve paths with experiment subdirectory
